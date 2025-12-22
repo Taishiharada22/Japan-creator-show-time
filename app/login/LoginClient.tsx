@@ -40,9 +40,7 @@ export default function LoginClient({ nextPath }: { nextPath: string }) {
     return (
         <div className="rounded-2xl border bg-white p-6 shadow-sm">
             <h1 className="text-2xl font-extrabold">Login</h1>
-            <p className="mt-2 text-sm text-gray-600">
-                ログイン後、{nextPath} に戻します。
-            </p>
+            <p className="mt-2 text-sm text-gray-600">ログイン後、{nextPath} に戻します。</p>
 
             {error && (
                 <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">

@@ -1,18 +1,24 @@
 // lib/stripe.ts
+import "server-only";
 import Stripe from "stripe";
 
-let _stripe: Stripe | null = null;
+declare global {
+    // eslint-disable-next-line no-var
+    var __stripe: Stripe | undefined;
+}
 
 export function getStripe() {
-    if (_stripe) return _stripe;
+    if (globalThis.__stripe) return globalThis.__stripe;
 
-    const key = process.env.STRIPE_SECRET_KEY?.trim();
-    if (!key) throw new Error("STRIPE_SECRET_KEY is missing");
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error("Missing env: STRIPE_SECRET_KEY");
 
-    // apiVersion を固定したい場合はここで指定（任意）
-    // _stripe = new Stripe(key, { apiVersion: "2024-06-20" as any });
+    globalThis.__stripe = new Stripe(key, {
+        typescript: true,
+        // apiVersion: "2024-06-20",
+    });
 
-    _stripe = new Stripe(key);
-
-    return _stripe;
+    return globalThis.__stripe;
 }
+
+export const stripe = getStripe();

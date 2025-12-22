@@ -14,56 +14,62 @@ function getOrigin(req: Request) {
     return new URL(req.url).origin;
 }
 
-async function getAuthedUser(req: Request) {
-    const auth = req.headers.get("authorization") ?? "";
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    if (!m) return null;
-
-    const token = m[1];
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data?.user) return null;
-
-    return data.user;
-}
-
-async function getStripeCustomerId(userId: string) {
-    const { data: prof, error } = await supabaseAdmin
+async function getOrCreateStripeCustomerId(userId: string, email?: string | null) {
+    const { data: prof, error: profErr } = await supabaseAdmin
         .from("profiles")
         .select("stripe_customer_id")
         .eq("id", userId)
         .maybeSingle();
 
-    if (error) throw error;
-    return (prof?.stripe_customer_id as string | null) ?? null;
+    if (profErr) throw profErr;
+
+    let customerId = (prof?.stripe_customer_id as string | null) ?? null;
+
+    if (!customerId) {
+        const stripe = getStripe();
+        const customer = await stripe.customers.create({
+            email: email ?? undefined,
+            metadata: { supabase_user_id: userId },
+        });
+        customerId = customer.id;
+
+        const { error: upErr } = await supabaseAdmin
+            .from("profiles")
+            .update({ stripe_customer_id: customerId })
+            .eq("id", userId);
+
+        if (upErr) throw upErr;
+    }
+
+    return customerId;
 }
 
 export async function POST(req: Request) {
     try {
-        const user = await getAuthedUser(req);
-        if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        const auth = req.headers.get("authorization") ?? "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
 
-        const body = await req.json().catch(() => ({}));
-        const returnPath = String(body?.returnPath ?? "/subscription");
+        if (!token) return NextResponse.json({ error: "missing token" }, { status: 401 });
 
-        const customerId = await getStripeCustomerId(user.id);
-        if (!customerId) {
-            return NextResponse.json(
-                { error: "No stripe_customer_id. Please start checkout at least once." },
-                { status: 400 }
-            );
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (error || !data?.user) {
+            return NextResponse.json({ error: "invalid session" }, { status: 401 });
         }
 
-        const origin = getOrigin(req);
-        const stripe = getStripe();
+        const user = data.user;
+        const customerId = await getOrCreateStripeCustomerId(user.id, user.email);
 
-        const session = await stripe.billingPortal.sessions.create({
+        const stripe = getStripe();
+        const origin = getOrigin(req);
+
+        const portal = await stripe.billingPortal.sessions.create({
             customer: customerId,
-            return_url: `${origin}${returnPath}`,
+            return_url: `${origin}/account`,
         });
 
-        return NextResponse.json({ url: session.url });
-    } catch (err: any) {
-        console.error("failed to open portal:", err);
-        return NextResponse.json({ error: err?.message ?? "failed to open portal" }, { status: 500 });
+        return NextResponse.json({ url: portal.url });
+    } catch (e: any) {
+        console.error("stripe portal error:", e);
+        return NextResponse.json({ error: e?.message ?? "portal failed" }, { status: 500 });
     }
 }
