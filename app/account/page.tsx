@@ -1,126 +1,67 @@
-// app/account/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
-import type { Session } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabaseClient";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
 export default function AccountPage() {
-    const router = useRouter();
-    const pathname = usePathname();
+    const openPortal = async () => {
+        const { data } = await supabase.auth.getSession();
+        const token = data.session?.access_token;
 
-    const [session, setSession] = useState<Session | null>(null);
-    const [checking, setChecking] = useState(true);
-    const [busy, setBusy] = useState(false);
+        if (!token) {
+            alert("ログインしてください");
+            return;
+        }
 
-    useEffect(() => {
-        let mounted = true;
-
-        (async () => {
-            const { data } = await supabase.auth.getSession();
-            const s = data.session ?? null;
-
-            if (!mounted) return;
-
-            if (!s) {
-                router.replace(`/login?next=${encodeURIComponent(pathname || "/account")}`);
-                return;
-            }
-
-            setSession(s);
-            setChecking(false);
-        })();
-
-        const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
-            if (!newSession) {
-                router.replace(`/login?next=${encodeURIComponent(pathname || "/account")}`);
-            } else {
-                setSession(newSession);
-            }
+        const res = await fetch("/api/billing-portal", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
         });
 
-        return () => {
-            mounted = false;
-            sub.subscription.unsubscribe();
-        };
-    }, [router, pathname]);
+        const contentType = res.headers.get("content-type") ?? "";
+        const text = await res.text(); // ✅ まず text で受ける（HTMLでもOK）
 
-    if (checking) {
-        return (
-            <main className="mx-auto max-w-3xl p-6">
-                <div className="rounded-lg border p-4 text-sm text-neutral-600">確認中...</div>
-            </main>
-        );
-    }
-
-    const openPortal = async () => {
-        if (busy) return;
-        setBusy(true);
-
-        try {
-            const token = session?.access_token;
-            if (!token) {
-                router.replace(`/login?next=${encodeURIComponent(pathname || "/account")}`);
-                return;
-            }
-
-            const res = await fetch("/api/billing-portal", {
-                method: "POST",
-                headers: { Authorization: `Bearer ${token}` },
-                cache: "no-store",
-            });
-
-            const text = await res.text();
-            let json: any = null;
-            try {
-                json = JSON.parse(text);
-            } catch { }
-
-            if (!res.ok) {
-                alert(json?.error ?? text ?? `billing portal failed (${res.status})`);
-                return;
-            }
-
-            const url = json?.url;
-            if (!url) {
-                alert(json?.error ?? "billing portal url is missing");
-                return;
-            }
-
-            window.location.href = url;
-        } finally {
-            setBusy(false);
+        // ✅ ここで「何が返ってるか」判定できる
+        if (!res.ok) {
+            alert(
+                `billing portal failed\nstatus=${res.status}\ncontent-type=${contentType}\n\n` +
+                text.slice(0, 400)
+            );
+            return;
         }
-    };
 
-    const logout = async () => {
-        await supabase.auth.signOut();
-        router.replace("/login");
+        if (!contentType.includes("application/json")) {
+            alert(
+                `Unexpected response (not JSON)\nstatus=${res.status}\ncontent-type=${contentType}\n\n` +
+                text.slice(0, 400)
+            );
+            return;
+        }
+
+        const json = JSON.parse(text);
+        if (!json?.url) {
+            alert(`No url returned\n\n${text.slice(0, 400)}`);
+            return;
+        }
+
+        window.location.href = json.url;
     };
 
     return (
         <main className="mx-auto max-w-3xl p-6 space-y-4">
-            <div className="flex items-center justify-between">
-                <h1 className="text-xl font-semibold">アカウント</h1>
-
-                <button onClick={logout} className="rounded-md border px-4 py-2 text-sm" type="button">
-                    ログアウト
-                </button>
-            </div>
+            <h1 className="text-xl font-semibold">アカウント</h1>
 
             <div className="rounded-lg border p-4 space-y-3">
                 <p className="text-sm text-neutral-600">
                     サブスクのプラン変更・支払い方法の更新・領収書確認・解約はStripeの管理画面で行えます。
                 </p>
 
-                <button
-                    onClick={openPortal}
-                    className="rounded-md border px-4 py-2 disabled:opacity-60"
-                    type="button"
-                    disabled={busy}
-                >
-                    {busy ? "開いています..." : "請求情報を管理"}
+                <button onClick={openPortal} className="rounded-md border px-4 py-2" type="button">
+                    請求情報を管理
                 </button>
             </div>
         </main>
