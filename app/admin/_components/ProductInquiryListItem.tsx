@@ -2,8 +2,8 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
 import { quickUpdateProductInquiryStatus } from "@/app/admin/_actions/quickStatus";
 
 type Row = {
@@ -35,23 +35,36 @@ function statusBadge(status: string) {
     return `${base} bg-gray-50 text-gray-700 border-gray-200`;
 }
 
+function readStatusFilterFromLocation(): string {
+    if (typeof window === "undefined") return "new";
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get("status") ?? "new";
+}
+
 export default function ProductInquiryListItem({ r }: { r: Row }) {
     const router = useRouter();
-    const sp = useSearchParams();
 
-    // 一覧のstatusフィルタ（無いなら new がデフォ）
-    const currentFilter = sp.get("status") ?? "new";
+    // ✅ useSearchParams を使わず、URLから読む（missing-suspense回避）
+    const [currentFilter, setCurrentFilter] = useState<string>("new");
 
     const [status, setStatus] = useState(r.status);
     const [hidden, setHidden] = useState(false);
     const [saving, setSaving] = useState(false);
     const [err, setErr] = useState<string | null>(null);
 
+    // ✅ 初回 & 戻る/進む（popstate）でフィルタを更新
+    useEffect(() => {
+        const sync = () => setCurrentFilter(readStatusFilterFromLocation());
+        sync();
+
+        const onPopState = () => sync();
+        window.addEventListener("popstate", onPopState);
+        return () => window.removeEventListener("popstate", onPopState);
+    }, []);
+
     if (hidden) return null;
 
-    const productTitle = Array.isArray(r.products)
-        ? r.products[0]?.title_ja ?? null
-        : (r.products as any)?.title_ja ?? null;
+    const productTitle = Array.isArray(r.products) ? r.products[0]?.title_ja ?? null : (r.products as any)?.title_ja ?? null;
 
     const hasNote = !!(r.internal_note ?? "").trim();
     const when = fmt((r.updated_at ?? r.created_at) as string);
@@ -78,7 +91,7 @@ export default function ProductInquiryListItem({ r }: { r: Row }) {
         fd.set("status", nextStatus);
 
         try {
-            // ✅ quickUpdateProductInquiryStatus は Promise<void>（戻り値なし）
+            // ✅ quickUpdateProductInquiryStatus は Promise<void>
             await quickUpdateProductInquiryStatus(fd);
             router.refresh(); // ✅ 裏データも同期
         } catch (e: any) {

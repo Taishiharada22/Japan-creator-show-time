@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 type ProductRow = {
@@ -31,11 +31,7 @@ function yen(n: number | null) {
 function safeKeyword(raw: string) {
     const s = raw.trim();
     if (!s) return "";
-    return s
-        .replaceAll(",", " ")
-        .replaceAll("%", "")
-        .replaceAll("_", "")
-        .slice(0, 80);
+    return s.replaceAll(",", " ").replaceAll("%", "").replaceAll("_", "").slice(0, 80);
 }
 
 function normalizeType(raw: string | null): ExperienceFilter {
@@ -51,10 +47,20 @@ function toNumberOrNull(s: string) {
     return n;
 }
 
+function readSearchParamsFromLocation(): { q: string; type: ExperienceFilter; min: string; max: string } {
+    if (typeof window === "undefined") {
+        return { q: "", type: "all", min: "", max: "" };
+    }
+    const sp = new URLSearchParams(window.location.search);
+    const q = sp.get("q") ?? "";
+    const type = normalizeType(sp.get("type"));
+    const min = sp.get("min") ?? "";
+    const max = sp.get("max") ?? "";
+    return { q, type, min, max };
+}
+
 export default function ProductSearchClient() {
     const router = useRouter();
-    const sp = useSearchParams();
-    const spKey = sp.toString(); // ✅ dependency 安定化用
 
     // state（URLと同期する）
     const [keyword, setKeyword] = useState("");
@@ -83,12 +89,7 @@ export default function ProductSearchClient() {
         return qs ? `?${qs}` : "";
     };
 
-    async function fetchProducts(input: {
-        q: string;
-        type: ExperienceFilter;
-        min: string;
-        max: string;
-    }) {
+    async function fetchProducts(input: { q: string; type: ExperienceFilter; min: string; max: string }) {
         setLoading(true);
         setErrorMessage(null);
 
@@ -129,26 +130,43 @@ export default function ProductSearchClient() {
         setLoading(false);
     }
 
-    // ✅ URLが変わったら state 同期（戻る/進む対応）＋その値でフェッチ
+    // ✅ 初回 & 戻る/進む（popstate）で URL → state 同期 + fetch
     useEffect(() => {
-        const q = sp.get("q") ?? "";
-        const type = normalizeType(sp.get("type"));
-        const min = sp.get("min") ?? "";
-        const max = sp.get("max") ?? "";
+        const syncAndFetch = () => {
+            const { q, type, min, max } = readSearchParamsFromLocation();
 
-        setKeyword(q);
-        setExperienceFilter(type);
-        setMinPrice(min);
-        setMaxPrice(max);
+            setKeyword(q);
+            setExperienceFilter(type);
+            setMinPrice(min);
+            setMaxPrice(max);
 
-        void fetchProducts({ q, type, min, max });
+            void fetchProducts({ q, type, min, max });
+        };
+
+        syncAndFetch();
+
+        const onPopState = () => syncAndFetch();
+        window.addEventListener("popstate", onPopState);
+
+        return () => {
+            window.removeEventListener("popstate", onPopState);
+        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [spKey]);
+    }, []);
 
     const onSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        router.push(`/product-search${buildQueryString()}`);
-        // ✅ fetch は URL 変更の useEffect が担当
+
+        const qs = buildQueryString();
+        router.push(`/product-search${qs}`);
+
+        // ✅ router.push では popstate が発火しないので、ここで fetch する
+        void fetchProducts({
+            q: keyword,
+            type: experienceFilter,
+            min: minPrice,
+            max: maxPrice,
+        });
     };
 
     const reset = () => {
@@ -156,8 +174,11 @@ export default function ProductSearchClient() {
         setExperienceFilter("all");
         setMinPrice("");
         setMaxPrice("");
+
         router.push("/product-search");
-        // ✅ fetch は URL 変更の useEffect が担当
+
+        // ✅ 即時反映
+        void fetchProducts({ q: "", type: "all", min: "", max: "" });
     };
 
     const tabBtn = (key: ExperienceFilter, label: string) => {
@@ -168,9 +189,7 @@ export default function ProductSearchClient() {
                 onClick={() => setExperienceFilter(key)}
                 className={[
                     "px-4 py-2 rounded-full text-sm border transition",
-                    active
-                        ? "bg-black text-white border-black"
-                        : "bg-white text-gray-900 border-gray-300 hover:bg-gray-50",
+                    active ? "bg-black text-white border-black" : "bg-white text-gray-900 border-gray-300 hover:bg-gray-50",
                 ].join(" ")}
             >
                 {label}
@@ -184,9 +203,7 @@ export default function ProductSearchClient() {
                 <div className="flex items-end justify-between gap-4 flex-wrap">
                     <div>
                         <h1 className="text-3xl font-bold tracking-tight">Product Search</h1>
-                        <p className="text-sm text-gray-600 mt-2">
-                            日本各地の作品・体験を、キーワード・種別・価格帯で絞り込めます。
-                        </p>
+                        <p className="text-sm text-gray-600 mt-2">日本各地の作品・体験を、キーワード・種別・価格帯で絞り込めます。</p>
                     </div>
                     <div className="text-xs text-gray-500">
                         <Link href="/" className="underline">
@@ -286,9 +303,7 @@ export default function ProductSearchClient() {
                 )}
 
                 {!loading && products.length === 0 && (
-                    <div className="border rounded-2xl p-6 text-sm text-gray-600 bg-white">
-                        条件に一致するプロダクトがありませんでした。
-                    </div>
+                    <div className="border rounded-2xl p-6 text-sm text-gray-600 bg-white">条件に一致するプロダクトがありませんでした。</div>
                 )}
 
                 {!loading && products.length > 0 && (
@@ -296,10 +311,7 @@ export default function ProductSearchClient() {
                         {products.map((p) => {
                             const badge = p.is_experience ? "Experience" : "Product";
                             return (
-                                <li
-                                    key={p.id}
-                                    className="border rounded-2xl p-5 bg-white shadow-sm hover:shadow-md transition"
-                                >
+                                <li key={p.id} className="border rounded-2xl p-5 bg-white shadow-sm hover:shadow-md transition">
                                     <div className="flex items-start justify-between gap-3">
                                         <div className="min-w-0">
                                             <h3 className="text-lg font-semibold leading-snug">
@@ -308,9 +320,7 @@ export default function ProductSearchClient() {
                                                 </Link>
                                             </h3>
                                             <div className="flex items-center gap-2 mt-2">
-                                                <span className="text-xs px-2 py-1 rounded-full border border-gray-300 text-gray-700">
-                                                    {badge}
-                                                </span>
+                                                <span className="text-xs px-2 py-1 rounded-full border border-gray-300 text-gray-700">{badge}</span>
                                                 <span className="text-sm font-semibold text-gray-900">{yen(p.price_jpy)}</span>
                                             </div>
                                         </div>
@@ -318,9 +328,7 @@ export default function ProductSearchClient() {
                                         <div className="w-20 h-20 rounded-xl bg-gray-100 border shrink-0" />
                                     </div>
 
-                                    <p className="text-sm text-gray-700 mt-4 line-clamp-3">
-                                        {p.description || "説明文は準備中です。"}
-                                    </p>
+                                    <p className="text-sm text-gray-700 mt-4 line-clamp-3">{p.description || "説明文は準備中です。"}</p>
 
                                     <div className="mt-4 flex items-center justify-between">
                                         {p.creator_id ? (
