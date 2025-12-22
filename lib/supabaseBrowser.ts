@@ -1,0 +1,15 @@
+// lib/supabaseBrowser.ts
+import { createBrowserClient } from "@supabase/ssr";
+
+export function supabaseBrowser() {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    if (!url || !key) {
+        throw new Error(
+            `Missing Supabase env vars. NEXT_PUBLIC_SUPABASE_URL=${String(url)} NEXT_PUBLIC_SUPABASE_ANON_KEY=${key ? "set" : "missing"}`
+        );
+    }
+
+    return createBrowserClient(url, key);
+}
