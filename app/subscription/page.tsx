@@ -2,21 +2,25 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 type DbTarget = "buyer" | "creator" | "bundle";
 type UiTab = DbTarget;
+
+type Currency = "JPY" | "USD";
 
 type SubscriptionPlan = {
     id: string;
     code: string;
     name: string;
     target: DbTarget;
-    monthly_price_jpy: number;
+    currency: Currency;
+    monthly_price_minor: number;
     description: string | null;
     features: string[] | null;
     sort_order: number | null;
+    is_active: boolean | null;
 };
 
 type UserSubscriptionRow = {
@@ -37,11 +41,17 @@ function asArray<T>(data: unknown): T[] {
     return Array.isArray(data) ? (data as T[]) : [];
 }
 
-function jpy(n: number) {
+function formatPrice(currency: Currency, minor: number) {
     try {
-        return `¥${n.toLocaleString()}`;
+        if (currency === "JPY") {
+            // JPYは最小単位=円として扱う
+            return `¥${Number(minor ?? 0).toLocaleString()}`;
+        }
+        // USDは cents
+        const dollars = (Number(minor ?? 0) / 100).toFixed(2);
+        return `$${dollars}`;
     } catch {
-        return `¥${n}`;
+        return currency === "JPY" ? `¥${minor}` : `$${minor}`;
     }
 }
 
@@ -55,12 +65,15 @@ async function getAccessTokenOrThrow() {
 
 export default function SubscriptionPage() {
     const router = useRouter();
+    const searchParams = useSearchParams();
+    const stripeReturn = searchParams.get("stripe") === "1";
 
     const [activeTab, setActiveTab] = useState<UiTab>("buyer");
     const [plans, setPlans] = useState<SubscriptionPlan[]>([]);
     const [currentRows, setCurrentRows] = useState<UserSubscriptionRow[]>([]);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [syncing, setSyncing] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const filteredPlans = useMemo(
@@ -72,7 +85,6 @@ export default function SubscriptionPage() {
     );
 
     const currentRowForTab = useMemo(() => {
-        // このtargetの active / past_due を「現在扱い」
         return (
             currentRows.find(
                 (r) =>
@@ -95,27 +107,25 @@ export default function SubscriptionPage() {
             error: userError,
         } = await supabase.auth.getUser();
 
-        // ✅ ログイン必須：未ログインなら /login へ
         if (userError || !user) {
             setLoading(false);
             router.replace(`/login?next=${encodeURIComponent("/subscription")}`);
             return;
         }
 
-        // ① プラン一覧
+        // ① 有料プランのみ（is_active=true & monthly_price_minor>0）
         const { data: planData, error: planError } = await supabase
             .from("subscription_plans")
-            .select(
-                "id, code, name, target, monthly_price_jpy, description, features, sort_order"
-            )
+            .select("id, code, name, target, currency, monthly_price_minor, description, features, sort_order, is_active")
+            .eq("is_active", true)
+            .gt("monthly_price_minor", 0)
             .order("target", { ascending: true })
             .order("sort_order", { ascending: true });
 
         if (planError) {
             console.error("planError", planError);
             setError(
-                `サブスクプランの取得に失敗しました。${planError.message ? `（${planError.message}）` : ""
-                }`
+                `プラン取得に失敗しました。${planError.message ? `（${planError.message}）` : ""}`
             );
             setLoading(false);
             return;
@@ -132,7 +142,7 @@ export default function SubscriptionPage() {
           plan_id,
           status,
           subscription_plans (
-            id, code, name, target, monthly_price_jpy, description, features, sort_order
+            id, code, name, target, currency, monthly_price_minor, description, features, sort_order, is_active
           )
         `
             )
@@ -141,8 +151,7 @@ export default function SubscriptionPage() {
         if (subError) {
             console.error("subError", subError);
             setError(
-                `現在のサブスク情報の取得に失敗しました。${subError.message ? `（${subError.message}）` : ""
-                }`
+                `現在のサブスク情報の取得に失敗しました。${subError.message ? `（${subError.message}）` : ""}`
             );
             setLoading(false);
             return;
@@ -157,7 +166,31 @@ export default function SubscriptionPage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // ✅ Portalを開く：accessTokenは body じゃなく Authorization で送る
+    // ✅ Stripeから戻ってきたら「強制同期」→ reload → URLのstripe=1を消す
+    useEffect(() => {
+        if (!stripeReturn) return;
+        if (syncing) return;
+
+        (async () => {
+            setSyncing(true);
+            try {
+                const accessToken = await getAccessTokenOrThrow();
+                await fetch("/api/stripe/sync-subscription", {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${accessToken}` },
+                }).catch(() => { });
+            } catch (e) {
+                // 同期失敗しても画面は落とさない
+                console.warn("sync-subscription failed (ignored)");
+            } finally {
+                await reload();
+                router.replace("/subscription"); // クエリ消す
+                setSyncing(false);
+            }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [stripeReturn]);
+
     const openBillingPortal = async () => {
         if (saving) return;
         setSaving(true);
@@ -191,7 +224,6 @@ export default function SubscriptionPage() {
         setSaving(false);
     };
 
-    // ✅ Checkout：accessTokenは body じゃなく Authorization で送る
     const startCheckoutOrPortal = async (plan: SubscriptionPlan) => {
         if (saving) return;
         setSaving(true);
@@ -229,11 +261,14 @@ export default function SubscriptionPage() {
         <main className="mx-auto max-w-5xl px-4 py-10">
             <header className="mb-8 space-y-2">
                 <h1 className="text-4xl font-extrabold tracking-tight">Subscription</h1>
-                <p className="text-sm text-gray-600">
-                    Buyer / Seller / Both を切り替えて、プランを選択します。
-                </p>
+                <p className="text-sm text-gray-600">有料プランのみ表示しています（無料Basicはサブスク対象外）。</p>
 
-                {/* 現在プラン（タブごと） */}
+                {syncing && (
+                    <div className="rounded-xl border bg-white px-4 py-2 text-sm">
+                        Stripeから戻りました。状態を同期中…
+                    </div>
+                )}
+
                 <div className="pt-3 text-sm">
                     {currentPlan ? (
                         <div className="flex flex-wrap items-center gap-2">
@@ -241,7 +276,9 @@ export default function SubscriptionPage() {
                                 Current ({activeTab})
                             </span>
                             <span className="font-semibold">{currentPlan.name}</span>
-                            <span className="text-gray-600">{jpy(currentPlan.monthly_price_jpy)}/月</span>
+                            <span className="text-gray-600">
+                                {formatPrice(currentPlan.currency, currentPlan.monthly_price_minor)}/月
+                            </span>
 
                             {currentStatus === "past_due" && (
                                 <span className="rounded-full border border-black bg-white px-3 py-1 text-xs font-semibold text-black">
@@ -250,18 +287,15 @@ export default function SubscriptionPage() {
                             )}
                         </div>
                     ) : (
-                        <div className="text-gray-600">Current ({activeTab}): 未選択</div>
+                        <div className="text-gray-600">Current ({activeTab}): 契約なし</div>
                     )}
                 </div>
             </header>
 
-            {/* ✅ past_due 導線 */}
             {currentStatus === "past_due" && (
                 <div className="mb-6 rounded-xl border border-black bg-white px-4 py-3 text-sm text-black">
                     <div className="font-semibold">支払いが「past_due」になっています。</div>
-                    <div className="mt-1 text-gray-700">
-                        決済方法を更新してから、必要ならプランを切り替えてください。
-                    </div>
+                    <div className="mt-1 text-gray-700">決済方法を更新してから、必要ならプランを切り替えてください。</div>
                     <div className="mt-3">
                         <button
                             disabled={saving}
@@ -280,7 +314,6 @@ export default function SubscriptionPage() {
                 </div>
             )}
 
-            {/* タブ */}
             <div className="mb-8 flex flex-wrap gap-4">
                 {TABS.map((t) => {
                     const active = activeTab === t.key;
@@ -305,10 +338,8 @@ export default function SubscriptionPage() {
                 <p className="text-sm text-gray-600">読み込み中...</p>
             ) : filteredPlans.length === 0 ? (
                 <div className="rounded-2xl border border-gray-200 bg-white p-6">
-                    <p className="text-sm text-gray-700">このカテゴリのプランはまだ準備中です。</p>
-                    <p className="mt-2 text-xs text-gray-500">
-                        ※ DB の subscription_plans に該当 target（{activeTab}）の行が無いとここになります。
-                    </p>
+                    <p className="text-sm text-gray-700">このカテゴリの有料プランはありません。</p>
+                    <p className="mt-2 text-xs text-gray-500">※ DBの subscription_plans（is_active=true & monthly_price_minor&gt;0）を確認。</p>
                 </div>
             ) : (
                 <div className="grid gap-6 md:grid-cols-2">
@@ -317,9 +348,7 @@ export default function SubscriptionPage() {
                         const isActive = isSamePlan && currentStatus === "active";
                         const isPastDue = isSamePlan && currentStatus === "past_due";
 
-                        const hasLiveSubscriptionInTab =
-                            currentStatus === "active" || currentStatus === "past_due";
-
+                        const hasLiveSubscriptionInTab = currentStatus === "active" || currentStatus === "past_due";
                         const willGoPortal = hasLiveSubscriptionInTab && !isSamePlan;
 
                         return (
@@ -337,9 +366,7 @@ export default function SubscriptionPage() {
                                     </div>
 
                                     {isActive && (
-                                        <span className="rounded-full bg-black px-3 py-1 text-xs font-semibold text-white">
-                                            Current
-                                        </span>
+                                        <span className="rounded-full bg-black px-3 py-1 text-xs font-semibold text-white">Current</span>
                                     )}
                                     {isPastDue && (
                                         <span className="rounded-full border border-black bg-white px-3 py-1 text-xs font-semibold text-black">
@@ -349,7 +376,7 @@ export default function SubscriptionPage() {
                                 </div>
 
                                 <div className="mt-4 text-3xl font-extrabold">
-                                    {jpy(plan.monthly_price_jpy)}
+                                    {formatPrice(plan.currency, plan.monthly_price_minor)}
                                     <span className="ml-1 text-base font-semibold text-gray-500">/ 月</span>
                                 </div>
 

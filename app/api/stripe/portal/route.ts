@@ -14,6 +14,12 @@ function getOrigin(req: Request) {
     return new URL(req.url).origin;
 }
 
+function withStripeReturn(urlStr: string) {
+    const u = new URL(urlStr);
+    u.searchParams.set("stripe", "1");
+    return u.toString();
+}
+
 async function getOrCreateStripeCustomerId(userId: string, email?: string | null) {
     const { data: prof, error: profErr } = await supabaseAdmin
         .from("profiles")
@@ -31,6 +37,7 @@ async function getOrCreateStripeCustomerId(userId: string, email?: string | null
             email: email ?? undefined,
             metadata: { supabase_user_id: userId },
         });
+
         customerId = customer.id;
 
         const { error: upErr } = await supabaseAdmin
@@ -46,30 +53,33 @@ async function getOrCreateStripeCustomerId(userId: string, email?: string | null
 
 export async function POST(req: Request) {
     try {
+        const stripe = getStripe();
+
         const auth = req.headers.get("authorization") ?? "";
         const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-
         if (!token) return NextResponse.json({ error: "missing token" }, { status: 401 });
 
         const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (error || !data?.user) {
-            return NextResponse.json({ error: "invalid session" }, { status: 401 });
-        }
+        if (error || !data?.user) return NextResponse.json({ error: "invalid session" }, { status: 401 });
 
         const user = data.user;
-        const customerId = await getOrCreateStripeCustomerId(user.id, user.email);
 
-        const stripe = getStripe();
+        const { returnPath } = (await req.json().catch(() => ({}))) as { returnPath?: string };
+
         const origin = getOrigin(req);
+        const baseBack = `${origin}${returnPath && returnPath.startsWith("/") ? returnPath : "/subscription"}`;
+        const back = withStripeReturn(baseBack);
+
+        const customerId = await getOrCreateStripeCustomerId(user.id, user.email);
 
         const portal = await stripe.billingPortal.sessions.create({
             customer: customerId,
-            return_url: `${origin}/account`,
+            return_url: back,
         });
 
         return NextResponse.json({ url: portal.url });
     } catch (e: any) {
-        console.error("stripe portal error:", e);
+        console.error("portal error:", e);
         return NextResponse.json({ error: e?.message ?? "portal failed" }, { status: 500 });
     }
 }

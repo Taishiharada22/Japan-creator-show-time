@@ -1,29 +1,30 @@
 // app/login/page.tsx
-import LoginClient from "./LoginClient";
+import { safeNextPath } from "@/lib/safeNextPath";
+import LoginForm from "./LoginForm";
 
-function safeNextPath(input: string | null) {
-    // オープンリダイレクト防止：必ず / から始まるパスだけ許可
-    if (!input) return "/account";
-    if (!input.startsWith("/")) return "/account";
-    return input;
-}
-
-type SP = Record<string, string | string[] | undefined>;
+type SearchParams = Record<string, string | string[] | undefined>;
 
 export default async function LoginPage({
     searchParams,
 }: {
-    // Next 16 では Promise になるケースがあるので両対応
-    searchParams?: SP | Promise<SP>;
+    searchParams: Promise<SearchParams>;
 }) {
-    const sp = await Promise.resolve(searchParams ?? {});
+    const sp = await searchParams;
+
     const raw = sp?.next;
     const nextStr = Array.isArray(raw) ? raw[0] : raw;
-    const nextPath = safeNextPath(nextStr ?? null);
+    const nextPath = safeNextPath(nextStr ?? null, "/");
 
     return (
-        <main className="mx-auto max-w-md p-6">
-            <LoginClient nextPath={nextPath} />
+        <main className="mx-auto max-w-md px-4 py-10">
+            <h1 className="text-3xl font-extrabold tracking-tight">Login</h1>
+
+            {/* デバッグ表示（不要なら消してOK） */}
+            <p className="mt-2 text-sm text-gray-600">next: {nextPath}</p>
+
+            <div className="mt-6">
+                <LoginForm nextPath={nextPath} />
+            </div>
         </main>
     );
 }

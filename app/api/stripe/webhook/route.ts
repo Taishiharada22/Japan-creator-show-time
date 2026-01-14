@@ -7,303 +7,643 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/**
- * ===== 型ズレ対策（Stripeの型が古い/ズレている時の保険）=====
- */
-type ExpandableId<T extends { id: string }> = string | T | null | undefined;
-
-function idFromExpandable<T extends { id: string }>(v: ExpandableId<T>) {
+/** ===== Stripe 型ズレ吸収 ===== */
+function idFromExpandable(v: any): string | null {
     if (!v) return null;
-    return typeof v === "string" ? v : v.id;
+    return typeof v === "string" ? v : typeof v === "object" ? (v.id ?? null) : null;
+}
+function isDeletedProduct(obj: any): boolean {
+    return !!obj && typeof obj === "object" && obj.deleted === true;
 }
 
-type CheckoutSessionPatched = Stripe.Checkout.Session & {
-    subscription?: ExpandableId<Stripe.Subscription>;
-    customer?: ExpandableId<Stripe.Customer>;
-};
-
-type InvoicePatched = Stripe.Invoice & {
-    subscription?: ExpandableId<Stripe.Subscription>;
-    customer?: ExpandableId<Stripe.Customer>;
-};
-
-type SubscriptionPatched = Stripe.Subscription & {
-    customer?: ExpandableId<Stripe.Customer>;
-};
-
-/**
- * ✅ status を Stripe から来る値 → DB用に正規化
- */
-function normalizeStatus(s: Stripe.Subscription.Status) {
+/** ===== subscription（既存のまま） ===== */
+function mapSubStatus(s: any): "active" | "past_due" | "canceled" {
     if (s === "active" || s === "trialing") return "active";
-    if (s === "past_due" || s === "unpaid") return "past_due";
-    if (s === "canceled") return "canceled";
+    if (s === "past_due" || s === "unpaid" || s === "incomplete") return "past_due";
+    if (s === "canceled" || s === "incomplete_expired" || s === "paused") return "canceled";
     return "past_due";
 }
+type PlanRow = { id: string; target: "buyer" | "creator" | "bundle" };
 
-/**
- * ✅ user_id 解決（metadata.user_id が最優先、無ければ profiles.stripe_customer_id で引く）
- */
-async function resolveUserId(params: {
-    customerId?: string | null;
-    metadataUserId?: string | null;
-}) {
-    const { customerId, metadataUserId } = params;
-
-    // 1) metadata.user_id が最優先
-    if (metadataUserId) return metadataUserId;
-
-    // 2) fallback: profiles.stripe_customer_id から user を引く
-    if (customerId) {
-        const { data, error } = await supabaseAdmin
-            .from("profiles")
-            .select("id")
-            .eq("stripe_customer_id", customerId)
-            .maybeSingle();
-
-        if (!error && data?.id) return data.id;
-    }
-    return null;
+async function findUserIdByCustomerId(customerId: string) {
+    const { data, error } = await supabaseAdmin
+        .from("profiles")
+        .select("id")
+        .eq("stripe_customer_id", customerId)
+        .maybeSingle();
+    if (error) throw error;
+    return data?.id ?? null;
 }
-
-/**
- * ✅ user_subscriptions に upsert
- * 前提: user_subscriptions.stripe_subscription_id に UNIQUE or PK がある
- */
-async function upsertSubscriptionRow(input: {
+function productIdFromSubscription(sub: any): string | null {
+    const item = sub?.items?.data?.[0] ?? null;
+    const price = item?.price ?? null;
+    const prod = price?.product ?? null;
+    return idFromExpandable(prod);
+}
+async function resolvePlanByProduct(productId: string) {
+    const { data, error } = await supabaseAdmin
+        .from("subscription_plans")
+        .select("id, target")
+        .eq("stripe_product_id", productId)
+        .eq("is_active", true)
+        .maybeSingle();
+    if (error) throw error;
+    return (data as PlanRow | null) ?? null;
+}
+async function upsertUserSubscription(params: {
     userId: string;
-    customerId: string | null;
-    subscription: Stripe.Subscription;
+    plan: PlanRow;
+    status: "active" | "past_due" | "canceled";
 }) {
-    const { userId, customerId, subscription } = input;
+    const { userId, plan, status } = params;
 
-    // price_id（基本は1つ目）
-    const priceId = subscription.items?.data?.[0]?.price?.id ?? null;
-
-    // current_period_end（秒）→ ISO
-    const currentPeriodEndSec = (subscription as any)?.current_period_end;
-    const currentPeriodEnd =
-        typeof currentPeriodEndSec === "number"
-            ? new Date(currentPeriodEndSec * 1000).toISOString()
-            : null;
-
-    const cancelAtPeriodEnd = !!(subscription as any)?.cancel_at_period_end;
-    const status = normalizeStatus(subscription.status);
-
-    const payload = {
-        user_id: userId,
-        stripe_customer_id: customerId,
-        stripe_subscription_id: subscription.id,
-        price_id: priceId,
-        status,
-        current_period_end: currentPeriodEnd,
-        cancel_at_period_end: cancelAtPeriodEnd,
-        updated_at: new Date().toISOString(),
-    };
-
-    const { error } = await supabaseAdmin
+    const { data: rows, error: actErr } = await supabaseAdmin
         .from("user_subscriptions")
-        .upsert(payload, { onConflict: "stripe_subscription_id" });
+        .select(
+            `
+      id,
+      plan_id,
+      status,
+      subscription_plans ( id, target )
+    `
+        )
+        .eq("user_id", userId);
 
-    if (error) {
-        console.error("user_subscriptions upsert error:", error, payload);
-        throw error;
+    if (actErr) throw actErr;
+
+    const list = (rows ?? []) as any[];
+    const sameTarget = list.filter((r) => r.subscription_plans?.target === plan.target);
+    const toCancel = sameTarget
+        .filter((r) => (r.status === "active" || r.status === "past_due") && r.plan_id !== plan.id)
+        .map((r) => r.id);
+
+    if (toCancel.length > 0) {
+        const { error: cancelErr } = await supabaseAdmin
+            .from("user_subscriptions")
+            .update({ status: "canceled" })
+            .in("id", toCancel);
+        if (cancelErr) throw cancelErr;
     }
+
+    const { data: existing, error: exErr } = await supabaseAdmin
+        .from("user_subscriptions")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("plan_id", plan.id)
+        .maybeSingle();
+
+    if (exErr) throw exErr;
+
+    if (existing?.id) {
+        const { error: upErr } = await supabaseAdmin
+            .from("user_subscriptions")
+            .update({ status })
+            .eq("id", existing.id);
+        if (upErr) throw upErr;
+    } else {
+        const { error: insErr } = await supabaseAdmin
+            .from("user_subscriptions")
+            .insert({ user_id: userId, plan_id: plan.id, status });
+        if (insErr) throw insErr;
+    }
+}
+
+/** ===== payment（物販）: product metadata から supabase_product_id を抜く ===== */
+function supabaseProductIdFromLineItem(li: any): string | null {
+    const price = li?.price ?? null;
+    const prod = price?.product ?? null;
+
+    if (!prod || typeof prod === "string") return null;
+    if (isDeletedProduct(prod)) return null;
+
+    const meta = prod?.metadata ?? null;
+    const v = meta?.supabase_product_id ?? null;
+    return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/** ===== shop_orders status ===== */
+type OrderStatus = "pending" | "paid" | "failed" | "canceled" | "partially_refunded" | "refunded";
+function isFinalRefunded(s: any) {
+    const v = String(s ?? "").toLowerCase();
+    return v === "refunded" || v === "partially_refunded";
+}
+
+/** ✅ 購入後：そのユーザーの active cart を全部掃除（重複active対策） */
+async function cleanupAllActiveCartsForUser(userId: string, sessionId: string) {
+    const { data: carts, error: cartErr } = await supabaseAdmin
+        .from("shop_carts")
+        .select("id,status")
+        .eq("user_id", userId)
+        .eq("status", "active");
+
+    if (cartErr) throw cartErr;
+
+    const ids = (carts ?? []).map((c: any) => c.id).filter(Boolean);
+    if (ids.length === 0) {
+        console.log("[cart cleanup] no active carts", { sessionId, userId });
+        return;
+    }
+
+    const { data: deleted, error: delErr } = await supabaseAdmin
+        .from("shop_cart_items")
+        .delete()
+        .in("cart_id", ids)
+        .select("id");
+    if (delErr) throw delErr;
+
+    const { error: upErr } = await supabaseAdmin
+        .from("shop_carts")
+        .update({ status: "ordered" })
+        .in("id", ids);
+    if (upErr) throw upErr;
+
+    console.log("[cart cleanup] cleared active carts", {
+        sessionId,
+        userId,
+        cartIds: ids,
+        deletedCount: Array.isArray(deleted) ? deleted.length : 0,
+    });
 }
 
 /**
- * ✅ subscriptionId で status だけ更新
+ * ✅ maybeSingle() を避ける：重複があっても落ちない
  */
-async function setStatusBySubscriptionId(subscriptionId: string, status: string) {
-    const { error } = await supabaseAdmin
-        .from("user_subscriptions")
-        .update({ status, updated_at: new Date().toISOString() })
-        .eq("stripe_subscription_id", subscriptionId);
+async function getOrderBySessionId(sessionId: string) {
+    const { data, error } = await supabaseAdmin
+        .from("shop_orders")
+        .select("id,status,amount_total_minor,amount_refunded_minor,created_at,stripe_charge_id")
+        .eq("stripe_checkout_session_id", sessionId)
+        .order("created_at", { ascending: false })
+        .limit(1);
 
-    if (error) {
-        console.error("user_subscriptions update error:", error, {
-            subscriptionId,
-            status,
-        });
-        throw error;
-    }
+    if (error) throw error;
+    return Array.isArray(data) ? (data[0] as any) ?? null : (data as any) ?? null;
+}
+async function getOrderByPaymentIntentId(piId: string) {
+    const { data, error } = await supabaseAdmin
+        .from("shop_orders")
+        .select("id,status,amount_total_minor,amount_refunded_minor,created_at,stripe_charge_id")
+        .eq("stripe_payment_intent_id", piId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+    if (error) throw error;
+    return Array.isArray(data) ? (data[0] as any) ?? null : (data as any) ?? null;
 }
 
-export async function POST(req: Request) {
-    // ✅ ここで初めて Stripe を初期化（import時クラッシュ回避）
-    let stripe: Stripe;
-    try {
-        stripe = getStripe();
-    } catch (e: any) {
-        console.error("getStripe() failed:", e?.message ?? e);
-        return NextResponse.json(
-            { error: e?.message ?? "Stripe init failed (check STRIPE_SECRET_KEY)" },
-            { status: 500 }
-        );
+async function updateOrderStatus(orderId: string, next: OrderStatus, patch: Record<string, any> = {}) {
+    const { data: cur, error: curErr } = await supabaseAdmin
+        .from("shop_orders")
+        .select("id,status,amount_total_minor,amount_refunded_minor,stripe_charge_id")
+        .eq("id", orderId)
+        .maybeSingle();
+    if (curErr) throw curErr;
+
+    const curStatus = cur?.status;
+
+    // 返金済みを下書き戻ししない
+    if (
+        isFinalRefunded(curStatus) &&
+        (next === "failed" || next === "canceled" || next === "pending" || next === "paid")
+    ) {
+        return;
+    }
+    // paid を failed に落とさない（原則）
+    if (String(curStatus).toLowerCase() === "paid" && next === "failed") {
+        return;
     }
 
-    const sig = req.headers.get("stripe-signature");
-    if (!sig) {
-        return NextResponse.json({ error: "Missing stripe-signature" }, { status: 400 });
+    // ✅ stripe_charge_id を NULL で上書きしない（patchにnullが来たら落とす）
+    const safePatch = { ...patch };
+    if ("stripe_charge_id" in safePatch && !safePatch.stripe_charge_id) {
+        delete safePatch.stripe_charge_id;
     }
 
-    // ✅ 署名検証（raw body 必須）
-    let event: Stripe.Event;
+    const { error: upErr } = await supabaseAdmin
+        .from("shop_orders")
+        .update({ status: next, ...safePatch })
+        .eq("id", orderId);
+    if (upErr) throw upErr;
+}
+
+/** ✅ 支払い成功：stripe_charge_id を確実に保存しておく（返金がchargeベースでも紐付く） */
+async function ensurePaidOrderFromCheckoutSession(stripe: any, sessionId: string) {
+    const full = (await stripe.checkout.sessions.retrieve(sessionId, {
+        expand: ["line_items.data.price.product", "payment_intent"],
+    })) as any;
+
+    if (full?.mode !== "payment") return;
+
+    const paid =
+        full?.payment_status === "paid" ||
+        full?.status === "complete" ||
+        (typeof full?.amount_total === "number" && full.amount_total > 0);
+
+    if (!paid) return;
+
+    const userIdFromMeta = (full?.metadata?.supabase_user_id as string | undefined) ?? null;
+
+    const customerId = idFromExpandable(full?.customer);
+    const userId = userIdFromMeta ?? (customerId ? await findUserIdByCustomerId(customerId) : null);
+
+    if (!userId) {
+        console.warn("payment webhook: user not found for session:", full?.id);
+        return;
+    }
+
+    const currency = String(full?.currency ?? "jpy").toUpperCase();
+    const subtotal = Number(full?.amount_subtotal ?? 0);
+    const total = Number(full?.amount_total ?? 0);
+
+    const paymentIntentId = idFromExpandable(full?.payment_intent);
+
+    // ✅ stripe_charge_id を確実に取る（失敗しても致命にしない）
+    let chargeId: string | null = null;
     try {
-        const secret = process.env.STRIPE_WEBHOOK_SECRET;
-        if (!secret) {
-            return NextResponse.json(
-                { error: "STRIPE_WEBHOOK_SECRET is missing (set whsec_... in .env.local / Vercel env)" },
-                { status: 500 }
-            );
+        // payment_intent が expand されてる時、latest_charge が取れる場合がある
+        if (full?.payment_intent && typeof full.payment_intent === "object") {
+            chargeId = idFromExpandable(full.payment_intent?.latest_charge) ?? null;
         }
 
-        const rawBody = Buffer.from(await req.arrayBuffer());
-        event = stripe.webhooks.constructEvent(rawBody, sig, secret);
+        // latest_charge が無い/取れないなら PI を取り直して charges から拾う
+        if (!chargeId && paymentIntentId) {
+            const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
+                expand: ["charges.data"],
+            });
+            chargeId =
+                (pi?.charges?.data?.[0]?.id as string | undefined) ??
+                idFromExpandable((pi as any)?.latest_charge) ??
+                null;
+        }
+    } catch (e: any) {
+        console.error("[payment] paymentIntents.retrieve failed", {
+            sessionId,
+            paymentIntentId,
+            msg: e?.message ?? e,
+        });
+        // chargeId は null のまま続行（注文作成自体は止めない）
+    }
+
+    // 既存注文があれば paid にして、足りないIDを埋める
+    const exists = await getOrderBySessionId(full.id);
+    if (exists?.id) {
+        const patch: Record<string, any> = {};
+        if (paymentIntentId) patch.stripe_payment_intent_id = paymentIntentId;
+        if (chargeId) patch.stripe_charge_id = chargeId;
+
+        await updateOrderStatus(exists.id, "paid", patch);
+        await cleanupAllActiveCartsForUser(userId, String(full.id));
+        return;
+    }
+
+    const { data: order, error: ordErr } = await supabaseAdmin
+        .from("shop_orders")
+        .insert({
+            user_id: userId,
+            status: "paid",
+            currency,
+            amount_subtotal_minor: subtotal,
+            amount_total_minor: total,
+            stripe_checkout_session_id: full.id,
+            stripe_payment_intent_id: paymentIntentId,
+            stripe_charge_id: chargeId, // ✅ ここが今回の追加
+        })
+        .select("id")
+        .single();
+    if (ordErr) throw ordErr;
+
+    const orderId = order.id as string;
+
+    const lineItems = (full?.line_items?.data ?? []) as any[];
+    const rows = lineItems
+        .map((li) => {
+            const supaProdId = supabaseProductIdFromLineItem(li);
+            if (!supaProdId) return null;
+
+            const qty = Number(li?.quantity ?? 1);
+            const unit = Number(li?.price?.unit_amount ?? 0);
+
+            return {
+                order_id: orderId,
+                product_id: supaProdId,
+                quantity: qty,
+                unit_price_minor: unit,
+                currency,
+            };
+        })
+        .filter(Boolean) as any[];
+
+    if (rows.length > 0) {
+        const { error: insErr } = await supabaseAdmin
+            .from("shop_order_items")
+            .upsert(rows, { onConflict: "order_id,product_id" });
+        if (insErr) throw insErr;
+    }
+
+    await cleanupAllActiveCartsForUser(userId, String(full.id));
+}
+
+/** ===== 失敗/キャンセル ===== */
+async function markFailedBySessionId(sessionId: string) {
+    const o = await getOrderBySessionId(sessionId);
+    if (!o?.id) return;
+    if (isFinalRefunded(o.status)) return;
+    await updateOrderStatus(o.id, "failed");
+}
+async function markFailedByPaymentIntentId(piId: string) {
+    const o = await getOrderByPaymentIntentId(piId);
+    if (!o?.id) return;
+    if (isFinalRefunded(o.status)) return;
+    await updateOrderStatus(o.id, "failed");
+}
+async function markCanceledBySessionId(sessionId: string) {
+    const o = await getOrderBySessionId(sessionId);
+    if (!o?.id) return;
+    if (isFinalRefunded(o.status)) return;
+    await updateOrderStatus(o.id, "canceled");
+}
+
+/** ===== 返金（冪等）===== */
+async function applyRefundFromCharge(charge: any) {
+    const piId = idFromExpandable(charge?.payment_intent);
+    const chargeId = String(charge?.id ?? "");
+    const refundedTotal = Number(charge?.amount_refunded ?? 0); // ✅ 合計返金額（冪等）
+
+    let order: any | null = null;
+    if (piId) order = await getOrderByPaymentIntentId(piId);
+
+    if (!order && chargeId) {
+        const { data, error } = await supabaseAdmin
+            .from("shop_orders")
+            .select("id,status,amount_total_minor,amount_refunded_minor,created_at")
+            .eq("stripe_charge_id", chargeId)
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+        if (error) throw error;
+        order = Array.isArray(data) ? (data[0] as any) ?? null : (data as any) ?? null;
+    }
+
+    if (!order?.id) return;
+
+    const total = Number(order?.amount_total_minor ?? 0);
+    const next: OrderStatus =
+        total > 0 && refundedTotal > 0 && refundedTotal < total ? "partially_refunded" : "refunded";
+
+    await updateOrderStatus(order.id, next, {
+        amount_refunded_minor: refundedTotal,
+        refunded_at: new Date().toISOString(),
+        stripe_charge_id: chargeId || null,
+    });
+}
+
+async function applyRefundFromRefundObject(stripe: any, refund: any) {
+    const chargeId = String(refund?.charge ?? "");
+    const refundId = String(refund?.id ?? "");
+    if (!chargeId) return;
+
+    // ✅ refund → charge を取得 → charge.amount_refunded（合計）で上書きするので冪等
+    let ch: any;
+    try {
+        ch = (await stripe.charges.retrieve(chargeId, { expand: ["payment_intent"] })) as any;
+    } catch (e: any) {
+        console.error("[refund] charge retrieve failed", { chargeId, refundId, msg: e?.message ?? e });
+        return; // retrieveできない時に500にしない（次のイベントで追いつける）
+    }
+
+    await applyRefundFromCharge(ch);
+
+    // 付帯情報：最新 refund id を記録（無くても致命ではない）
+    const piId = idFromExpandable(ch?.payment_intent);
+    if (!piId) return;
+
+    const o = await getOrderByPaymentIntentId(piId);
+    if (!o?.id) return;
+
+    const { error } = await supabaseAdmin
+        .from("shop_orders")
+        .update({ stripe_latest_refund_id: refundId })
+        .eq("id", o.id);
+
+    if (error) throw error;
+}
+
+/** ===== Webhookイベント冪等（evt_ 重複防止） ===== */
+async function claimStripeEventOnce(event: Stripe.Event) {
+    const evId = event.id;
+    const row = {
+        id: evId,
+        type: event.type,
+        livemode: !!(event as any).livemode,
+        stripe_created:
+            typeof (event as any).created === "number"
+                ? new Date((event as any).created * 1000).toISOString()
+                : null,
+        status: "processing", // received/processing/processed/error
+        error: null,
+        processed_at: null,
+    };
+
+    // 1) まず insert を試す
+    const { error: insErr } = await supabaseAdmin.from("stripe_webhook_events").insert(row);
+    if (!insErr) return { shouldProcess: true, isFirst: true };
+
+    // 2) duplicate key なら既存を確認
+    const dup = (insErr as any)?.code === "23505" || (insErr as any)?.status === 409;
+    if (!dup) throw insErr;
+
+    const { data: existing, error: selErr } = await supabaseAdmin
+        .from("stripe_webhook_events")
+        .select("id,status")
+        .eq("id", evId)
+        .maybeSingle();
+    if (selErr) throw selErr;
+
+    const st = String((existing as any)?.status ?? "");
+    if (st === "processed") {
+        return { shouldProcess: false, isFirst: false, status: st };
+    }
+
+    // processed 以外（received/error/processing）は再処理させる
+    const { error: upErr } = await supabaseAdmin
+        .from("stripe_webhook_events")
+        .update({ status: "processing", error: null, processed_at: null })
+        .eq("id", evId);
+    if (upErr) throw upErr;
+
+    return { shouldProcess: true, isFirst: false, status: st };
+}
+
+async function markStripeEventProcessed(eventId: string) {
+    const { error } = await supabaseAdmin
+        .from("stripe_webhook_events")
+        .update({ status: "processed", processed_at: new Date().toISOString() })
+        .eq("id", eventId);
+    if (error) throw error;
+}
+
+async function markStripeEventError(eventId: string, msg: string) {
+    const { error } = await supabaseAdmin
+        .from("stripe_webhook_events")
+        .update({ status: "error", error: msg, processed_at: new Date().toISOString() })
+        .eq("id", eventId);
+    if (error) throw error;
+}
+
+/** ===== handler ===== */
+export async function POST(req: Request) {
+    const stripe = getStripe();
+    const sig = req.headers.get("stripe-signature");
+    const whsec = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!sig || !whsec) {
+        return NextResponse.json({ error: "missing stripe webhook config" }, { status: 400 });
+    }
+
+    let event: Stripe.Event;
+
+    try {
+        const payload = await req.text();
+        event = stripe.webhooks.constructEvent(payload, sig, whsec);
     } catch (err: any) {
-        console.error("Webhook signature verify failed:", err?.message ?? err);
-        return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
+        console.error("webhook signature verify failed:", err?.message ?? err);
+        return NextResponse.json({ error: "invalid signature" }, { status: 400 });
+    }
+
+    const evId = String((event as any)?.id ?? "");
+    const eventType = String((event as any)?.type ?? "");
+    const livemode = !!(event as any)?.livemode;
+
+    console.log("[stripe webhook] in", { evId, eventType, livemode });
+
+    // ✅ evt_ 重複対策：同じイベントは1回だけ処理
+    let claimed = false;
+    try {
+        const claim = await claimStripeEventOnce(event);
+        claimed = claim.shouldProcess;
+
+        if (!claim.shouldProcess) {
+            return NextResponse.json({ received: true, duplicate: true });
+        }
+    } catch (e: any) {
+        console.error("[stripe webhook] claim error", { evId, msg: e?.message ?? e });
+        return NextResponse.json({ error: e?.message ?? "claim failed" }, { status: 500 });
     }
 
     try {
-        switch (event.type) {
-            /**
-             * ✅ 初回決済完了（Checkout）
-             */
-            case "checkout.session.completed": {
-                const session = event.data.object as CheckoutSessionPatched;
-
-                const customerId =
-                    idFromExpandable(session.customer) ??
-                    ((session.customer as unknown) as string | null) ??
-                    null;
-
-                const subscriptionId =
-                    idFromExpandable(session.subscription) ??
-                    ((session.subscription as unknown) as string | null) ??
-                    null;
-
-                const metadataUserId = session.metadata?.user_id ?? null;
-
-                const userId = await resolveUserId({ customerId, metadataUserId });
-                if (!userId) {
-                    console.error("No userId resolved for checkout.session.completed", {
-                        customerId,
-                        subscriptionId,
-                        metadataUserId,
-                        sessionId: session.id,
-                    });
-                    // ✅ 失敗でも Stripe に再送させたくないケースなので 200 返す
-                    return NextResponse.json({ received: true, ignored: true });
-                }
-
-                if (!subscriptionId) {
-                    console.error("No subscriptionId on checkout.session.completed", {
-                        sessionId: session.id,
-                        customerId,
-                    });
-                    return NextResponse.json({ received: true, ignored: true });
-                }
-
-                // Stripe から subscription を取り直してDB反映
-                const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-                await upsertSubscriptionRow({
-                    userId,
-                    customerId,
-                    subscription,
-                });
-
-                break;
-            }
-
-            /**
-             * ✅ サブスク作成/更新（プラン変更、支払い状況変化、期間更新など）
-             */
+        switch (eventType) {
+            /** ===== subscription sync ===== */
             case "customer.subscription.created":
-            case "customer.subscription.updated": {
-                const subscription = event.data.object as SubscriptionPatched;
-
-                const customerId =
-                    idFromExpandable(subscription.customer) ??
-                    ((subscription.customer as unknown) as string | null) ??
-                    null;
-
-                const metadataUserId = subscription.metadata?.user_id ?? null;
-
-                const userId = await resolveUserId({ customerId, metadataUserId });
-                if (!userId) {
-                    console.error("No userId resolved for subscription event", {
-                        type: event.type,
-                        customerId,
-                        subscriptionId: subscription.id,
-                    });
-                    return NextResponse.json({ received: true, ignored: true });
-                }
-
-                await upsertSubscriptionRow({
-                    userId,
-                    customerId,
-                    subscription: subscription as Stripe.Subscription,
-                });
-
-                break;
-            }
-
-            /**
-             * ✅ 解約（Stripe側で削除）
-             */
+            case "customer.subscription.updated":
             case "customer.subscription.deleted": {
-                const subscription = event.data.object as Stripe.Subscription;
-                await setStatusBySubscriptionId(subscription.id, "canceled");
+                const sub = event.data.object as any;
+
+                const customerId = idFromExpandable(sub?.customer);
+                if (!customerId) break;
+
+                const userId = await findUserIdByCustomerId(customerId);
+                if (!userId) break;
+
+                const prodId = productIdFromSubscription(sub);
+                if (!prodId) break;
+
+                const plan = await resolvePlanByProduct(prodId);
+                if (!plan) break;
+
+                const status = mapSubStatus(sub?.status);
+                await upsertUserSubscription({ userId, plan, status });
                 break;
             }
 
-            /**
-             * ✅ 支払い失敗 → past_due
-             */
+            case "invoice.paid":
             case "invoice.payment_failed": {
-                const invoice = event.data.object as InvoicePatched;
+                const inv = event.data.object as any;
 
-                const subscriptionId =
-                    idFromExpandable(invoice.subscription) ??
-                    ((invoice.subscription as unknown) as string | null) ??
-                    null;
+                const subId = idFromExpandable(inv?.subscription);
+                if (!subId) break;
 
-                if (subscriptionId) {
-                    await setStatusBySubscriptionId(subscriptionId, "past_due");
-                }
+                const sub = (await stripe.subscriptions.retrieve(subId, {
+                    expand: ["items.data.price.product"],
+                })) as any;
+
+                const customerId = idFromExpandable(sub?.customer);
+                if (!customerId) break;
+
+                const userId = await findUserIdByCustomerId(customerId);
+                if (!userId) break;
+
+                const prodId = productIdFromSubscription(sub);
+                if (!prodId) break;
+
+                const plan = await resolvePlanByProduct(prodId);
+                if (!plan) break;
+
+                const status = eventType === "invoice.paid" ? "active" : "past_due";
+                await upsertUserSubscription({ userId, plan, status });
                 break;
             }
 
-            /**
-             * ✅ 支払い成功 → active
-             */
-            case "invoice.paid": {
-                const invoice = event.data.object as InvoicePatched;
+            /** ===== payment order (success) ===== */
+            case "checkout.session.completed":
+            case "checkout.session.async_payment_succeeded": {
+                const s = event.data.object as any;
+                if (s?.id) await ensurePaidOrderFromCheckoutSession(stripe, String(s.id));
+                break;
+            }
 
-                const subscriptionId =
-                    idFromExpandable(invoice.subscription) ??
-                    ((invoice.subscription as unknown) as string | null) ??
-                    null;
+            /** ===== payment failed / canceled ===== */
+            case "checkout.session.async_payment_failed": {
+                const s = event.data.object as any;
+                if (s?.id) await markFailedBySessionId(String(s.id));
+                break;
+            }
+            case "checkout.session.expired": {
+                const s = event.data.object as any;
+                if (s?.id) await markCanceledBySessionId(String(s.id));
+                break;
+            }
+            case "payment_intent.payment_failed": {
+                const pi = event.data.object as any;
+                const piId = String(pi?.id ?? "");
+                if (piId) await markFailedByPaymentIntentId(piId);
+                break;
+            }
 
-                if (subscriptionId) {
-                    await setStatusBySubscriptionId(subscriptionId, "active");
-                }
+            /** ===== refund ===== */
+            case "charge.refunded": {
+                const ch = event.data.object as any;
+                await applyRefundFromCharge(ch);
+                break;
+            }
+
+            case "refund.created":
+            case "refund.updated":
+            case "charge.refund.updated":
+            case "charge.refund.created": {
+                const rf = event.data.object as any;
+                await applyRefundFromRefundObject(stripe, rf);
                 break;
             }
 
             default:
-                // ✅ 未対応イベントは 200 で返す（Stripeの再送地獄を避ける）
                 break;
         }
 
+        // ✅ 成功したら processed
+        await markStripeEventProcessed(evId);
+
         return NextResponse.json({ received: true });
-    } catch (err: any) {
-        console.error("Webhook handler error:", event?.type, err?.message ?? err);
-        return NextResponse.json(
-            { error: err?.message ?? "Webhook handler failed" },
-            { status: 500 }
-        );
+    } catch (e: any) {
+        console.error("webhook handler error:", { evId, eventType, msg: e?.message ?? e });
+        // ✅ 失敗は error で残す（Stripeがリトライする）
+        try {
+            await markStripeEventError(evId, e?.message ?? String(e));
+        } catch (markErr: any) {
+            console.error("[stripe webhook] failed to mark error:", markErr?.message ?? markErr);
+        }
+
+        return NextResponse.json({ error: e?.message ?? "webhook failed" }, { status: 500 });
+    } finally {
+        void claimed;
     }
 }

@@ -31,6 +31,7 @@ async function getOrCreateStripeCustomerId(userId: string, email?: string | null
             email: email ?? undefined,
             metadata: { supabase_user_id: userId },
         });
+
         customerId = customer.id;
 
         const { error: upErr } = await supabaseAdmin
@@ -50,7 +51,6 @@ export async function POST(req: Request) {
 
         const auth = req.headers.get("authorization") ?? "";
         const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-
         if (!token) {
             return NextResponse.json({ error: "missing token" }, { status: 401 });
         }
@@ -61,6 +61,7 @@ export async function POST(req: Request) {
         }
 
         const user = data.user;
+
         const customerId = await getOrCreateStripeCustomerId(user.id, user.email);
 
         const origin = getOrigin(req);

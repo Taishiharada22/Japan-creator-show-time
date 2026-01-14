@@ -46,9 +46,9 @@ function fmtJST(d: string) {
 export default async function AdminPage({
     searchParams,
 }: {
-    searchParams?: Promise<Record<string, string | string[] | undefined>>;
+    searchParams?: Record<string, string | string[] | undefined>;
 }) {
-    const sp = (await searchParams) ?? {};
+    const sp = searchParams ?? {};
 
     // ✅ デフォルトは "new"
     const statusParam = typeof sp.status === "string" ? sp.status : "";

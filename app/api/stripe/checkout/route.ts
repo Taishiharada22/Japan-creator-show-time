@@ -6,8 +6,6 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const stripe = getStripe();
-
 function getOrigin(req: Request) {
     const h = req.headers;
     const proto = h.get("x-forwarded-proto") ?? "http";
@@ -16,23 +14,10 @@ function getOrigin(req: Request) {
     return new URL(req.url).origin;
 }
 
-function safePath(p: string) {
-    // "/subscription" みたいなパスだけ許可（外部URL注入防止）
-    if (!p) return "/subscription";
-    if (!p.startsWith("/")) return "/subscription";
-    if (p.startsWith("//")) return "/subscription";
-    return p;
-}
-
-async function getAuthedUser(req: Request) {
-    const auth = req.headers.get("authorization") ?? "";
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    if (!m) return null;
-
-    const token = m[1];
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data?.user) return null;
-    return data.user; // { id, email, ... }
+function withStripeReturn(urlStr: string) {
+    const u = new URL(urlStr);
+    u.searchParams.set("stripe", "1");
+    return u.toString();
 }
 
 async function getOrCreateStripeCustomerId(userId: string, email?: string | null) {
@@ -44,95 +29,137 @@ async function getOrCreateStripeCustomerId(userId: string, email?: string | null
 
     if (profErr) throw profErr;
 
-    if (prof?.stripe_customer_id) return prof.stripe_customer_id as string;
+    let customerId = (prof?.stripe_customer_id as string | null) ?? null;
 
-    const customer = await stripe.customers.create({
-        email: email ?? undefined,
-        metadata: { user_id: userId },
+    if (!customerId) {
+        const stripe = getStripe();
+        const customer = await stripe.customers.create({
+            email: email ?? undefined,
+            metadata: { supabase_user_id: userId },
+        });
+
+        customerId = customer.id;
+
+        const { error: upErr } = await supabaseAdmin
+            .from("profiles")
+            .update({ stripe_customer_id: customerId })
+            .eq("id", userId);
+
+        if (upErr) throw upErr;
+    }
+
+    return customerId;
+}
+
+async function resolveMonthlyPriceIdFromProduct(params: { productId: string; currency: "JPY" | "USD" }) {
+    const stripe = getStripe();
+    const currency = params.currency.toLowerCase();
+
+    const prices = await stripe.prices.list({
+        product: params.productId,
+        active: true,
+        limit: 100,
     });
 
-    const { error: upErr } = await supabaseAdmin
-        .from("profiles")
-        .update({ stripe_customer_id: customer.id })
-        .eq("id", userId);
+    const picked =
+        prices.data.find(
+            (p) =>
+                p.active &&
+                p.type === "recurring" &&
+                p.recurring?.interval === "month" &&
+                p.currency === currency
+        ) ??
+        prices.data.find((p) => p.active && p.type === "recurring" && p.recurring?.interval === "month");
 
-    if (upErr) throw upErr;
-
-    return customer.id;
+    return picked?.id ?? null;
 }
 
 export async function POST(req: Request) {
     try {
-        const user = await getAuthedUser(req);
-        if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        const stripe = getStripe();
 
-        const body = await req.json().catch(() => ({}));
+        const auth = req.headers.get("authorization") ?? "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+        if (!token) return NextResponse.json({ error: "missing token" }, { status: 401 });
 
-        // planId or planCode のどちらでもOKにする（運用が楽）
-        const planId = String(body?.planId ?? "").trim();
-        const planCode = String(body?.planCode ?? "").trim();
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (error || !data?.user) return NextResponse.json({ error: "invalid session" }, { status: 401 });
 
-        const returnPath = safePath(String(body?.returnPath ?? "/subscription"));
+        const user = data.user;
 
-        if (!planId && !planCode) {
-            return NextResponse.json({ error: "planId or planCode is required" }, { status: 400 });
-        }
+        const { planId, returnPath } = (await req.json().catch(() => ({}))) as {
+            planId?: string;
+            returnPath?: string;
+        };
+        if (!planId) return NextResponse.json({ error: "missing planId" }, { status: 400 });
 
-        // ✅ DBから plan を取る（id優先、なければcode）
-        const q = supabaseAdmin
+        const { data: plan, error: planErr } = await supabaseAdmin
             .from("subscription_plans")
-            .select("id, code, name, monthly_price_jpy, stripe_price_id")
-            .limit(1);
+            .select("id, code, target, currency, monthly_price_minor, stripe_price_id, stripe_product_id, is_active")
+            .eq("id", planId)
+            .maybeSingle();
 
-        const { data: plan, error: planErr } = planId
-            ? await q.eq("id", planId).maybeSingle()
-            : await q.eq("code", planCode).maybeSingle();
+        if (planErr || !plan) return NextResponse.json({ error: "plan not found" }, { status: 404 });
+        if (plan.is_active === false) return NextResponse.json({ error: `plan "${plan.code}" is not active` }, { status: 400 });
+        if ((plan.monthly_price_minor ?? 0) <= 0) return NextResponse.json({ error: `plan "${plan.code}" is not paid` }, { status: 400 });
 
-        if (planErr || !plan) {
-            return NextResponse.json({ error: "plan not found" }, { status: 404 });
-        }
+        let priceId: string | null = plan.stripe_price_id ?? null;
 
-        const priceId = (plan as any).stripe_price_id as string | null;
         if (!priceId) {
-            // 無料プラン or 未設定
-            return NextResponse.json(
-                { error: "This plan has no stripe_price_id (free plan or not purchasable yet)." },
-                { status: 400 }
-            );
+            const productId = plan.stripe_product_id ?? null;
+            if (!productId) {
+                return NextResponse.json(
+                    { error: `missing stripe identifiers for plan code="${plan.code}". Set subscription_plans.stripe_price_id OR stripe_product_id` },
+                    { status: 400 }
+                );
+            }
+
+            priceId = await resolveMonthlyPriceIdFromProduct({
+                productId,
+                currency: plan.currency as "JPY" | "USD",
+            });
+
+            if (!priceId) {
+                return NextResponse.json(
+                    { error: `could not find active monthly price for product="${productId}" (plan="${plan.code}")` },
+                    { status: 400 }
+                );
+            }
         }
 
         const origin = getOrigin(req);
+        const baseBack = `${origin}${returnPath && returnPath.startsWith("/") ? returnPath : "/subscription"}`;
+        const back = withStripeReturn(baseBack);
+
         const customerId = await getOrCreateStripeCustomerId(user.id, user.email);
 
         const session = await stripe.checkout.sessions.create({
             mode: "subscription",
             customer: customerId,
             line_items: [{ price: priceId, quantity: 1 }],
+            success_url: back,
+            cancel_url: back,
 
-            success_url: `${origin}/account?checkout=success`,
-            cancel_url: `${origin}${returnPath}?checkout=cancel`,
-
-            // webhookで userId / plan を確実に特定
             metadata: {
-                user_id: user.id,
-                plan_id: (plan as any).id,
-                plan_code: (plan as any).code ?? "",
+                supabase_user_id: user.id,
+                plan_id: plan.id,
+                plan_code: plan.code,
+                plan_target: plan.target,
             },
+
             subscription_data: {
                 metadata: {
-                    user_id: user.id,
-                    plan_id: (plan as any).id,
-                    plan_code: (plan as any).code ?? "",
+                    supabase_user_id: user.id,
+                    plan_id: plan.id,
+                    plan_code: plan.code,
+                    plan_target: plan.target,
                 },
             },
         });
 
         return NextResponse.json({ url: session.url });
-    } catch (err: any) {
-        console.error("failed to create checkout:", err);
-        return NextResponse.json(
-            { error: err?.message ?? "failed to create checkout" },
-            { status: 500 }
-        );
+    } catch (e: any) {
+        console.error("checkout error:", e);
+        return NextResponse.json({ error: e?.message ?? "checkout failed" }, { status: 500 });
     }
 }

@@ -23,7 +23,8 @@ export default function HomePage() {
           </li>
 
           <li>
-            <Link href="/search-products" className="text-blue-600 underline">
+            {/* ✅ 実在するルートに合わせる */}
+            <Link href="/product-search" className="text-blue-600 underline">
               プロダクト検索（体験・物販を絞り込む）
             </Link>
           </li>
@@ -52,6 +53,22 @@ export default function HomePage() {
         <p>
           将来的には、写真ギャラリー・動画・多言語対応・決済などを追加していく想定です。
         </p>
+      </section>
+
+      {/* ✅ Stripe 審査/確認で効く情報（公開） */}
+      <section className="space-y-2 text-sm text-gray-600">
+        <p>運営者連絡先：your-email@example.com（←実メールに置換）</p>
+        <div className="flex gap-4">
+          <Link href="/terms" className="underline">
+            利用規約
+          </Link>
+          <Link href="/privacy" className="underline">
+            プライバシーポリシー
+          </Link>
+          <Link href="/refund" className="underline">
+            返金・キャンセル
+          </Link>
+        </div>
       </section>
 
       {/* ✅ 運営者への問い合わせ（Homeから送れる） */}

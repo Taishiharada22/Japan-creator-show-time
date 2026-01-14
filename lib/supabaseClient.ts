@@ -1,7 +1,9 @@
-import { createClient } from "@supabase/supabase-js";
+// lib/supabaseClient.ts
+import { createBrowserClient } from "@supabase/ssr";
 
-// ★ ここに自分の Supabase の URL と anon キーを直書き
-const supabaseUrl = "https://czxmtdqbyeeouvtdbmul.supabase.co";
-const supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN6eG10ZHFieWVlb3V2dGRibXVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU1MDMyODEsImV4cCI6MjA4MTA3OTI4MX0.tUishh6Ba8hbQVZjDRzzcnPC4oD5Z4dxAc3mB9yxiBs";
+const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const key =
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase = createBrowserClient(url, key);
